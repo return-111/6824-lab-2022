@@ -1,10 +1,16 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"time"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -13,6 +19,14 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -24,7 +38,6 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
 //
 // main/mrworker.go calls this function.
 //
@@ -35,7 +48,120 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
+	for {
+		args := RequestArgs{os.Getpid()}
+		reply := RequestReply{}
+		ok := call("Coordinator.RequestHandler", &args, &reply)
+		if !ok {
+			return
+		} else if reply.Op == DONE {
+			return
+		} else if reply.Op == WAIT {
+			time.Sleep(time.Second)
+			continue
+		} else if reply.Op == MAP {
+			nReduce := reply.Nreduce
+			// fmt.Printf("%d map\n", reply.Fid)
+			file, err := os.Open(reply.Name)
+			if err != nil {
+				log.Fatalf("cannot open %v", reply.Name)
+			}
+			content, err := ioutil.ReadAll(file)
+			if err != nil {
+				log.Fatalf("cannot read %v", reply.Name)
+			}
+			file.Close()
+			kva := mapf(reply.Name, string(content))
 
+			//Create temp file
+			tempFile := make([]*os.File, nReduce)
+			enc := make([]*json.Encoder, nReduce)
+
+			for i := range tempFile {
+				temp, err := ioutil.TempFile("./", "tmp-*")
+				if err != nil {
+					log.Fatalf("cannot create temp file")
+				}
+				tempFile[i] = temp
+				enc[i] = json.NewEncoder(temp)
+				defer temp.Close()
+			}
+			//Write to temp file
+			for _, kv := range kva {
+				buckid := ihash(kv.Key) % nReduce
+				err := enc[buckid].Encode(&kv)
+				if err != nil {
+					log.Fatalf("failed to write file: %s kv: %v %v", tempFile[buckid].Name(), kv.Key, kv.Value)
+				}
+			}
+
+			//Rename temp file
+			for i := range tempFile {
+				filename := fmt.Sprintf("mr-%d-%d", reply.Fid, i)
+				err := os.Rename(tempFile[i].Name(), filename)
+				if err != nil {
+					log.Fatalf("cannot rename temp file")
+				}
+			}
+			// filename := ""
+			// fmt.Sprintf(filename, "mr-%d-%d")
+			// err = os.Rename(tempFile.Name(), filename)
+			// if err != nil {
+			// 	log.Fatalf("cannot rename tempfile")
+			// }
+		} else if reply.Op == REDUCE {
+			nMap := reply.Nmap
+
+			//read intermediate
+			intermediate := []KeyValue{}
+			for i := 0; i < nMap; i++ {
+				filename := fmt.Sprintf("mr-%d-%d", i, reply.Fid)
+				file, err := os.Open(filename)
+				if err != nil {
+					log.Fatalf("cannot open %v", filename)
+				}
+				dec := json.NewDecoder(file)
+				for {
+					var kv KeyValue
+					if err := dec.Decode(&kv); err != nil {
+						break
+					}
+					intermediate = append(intermediate, kv)
+				}
+			}
+			sort.Sort(ByKey(intermediate))
+
+			oname := fmt.Sprintf("mr-out-%d", reply.Fid)
+			ofile, _ := os.Create(oname)
+
+			//
+			// call Reduce on each distinct key in intermediate[],
+			// and print the result to mr-out-*.
+			//
+			i := 0
+			for i < len(intermediate) {
+				j := i + 1
+				for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+					j++
+				}
+				values := []string{}
+				for k := i; k < j; k++ {
+					values = append(values, intermediate[k].Value)
+				}
+				output := reducef(intermediate[i].Key, values)
+
+				// this is the correct format for each line of Reduce output.
+				fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+
+				i = j
+			}
+
+			ofile.Close()
+			// fmt.Printf("%d reduce\n", reply.Fid)
+		} else {
+			panic("111")
+		}
+	}
 }
 
 //
